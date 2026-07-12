@@ -1,0 +1,185 @@
+# build-kernel-droidspaces.yml
+#
+# Compila o kernel Motorola sm7325 (dubai, msm-5.4, branch
+# MMI-S1RD32.55-33) usando o build.sh real do repositório (estilo
+# "AtomX"), aplicando antes os patches oficiais do Droidspaces
+# (non-GKI) para permitir rodar Droidspaces (containers via namespaces)
+# nesse kernel.
+#
+# O build.sh do repositório:
+#   - Espera ser executado DE DENTRO da pasta do kernel (KERNEL_DIR=$(pwd)).
+#   - Espera um toolchain Clang em "../toolchains/clang/bin/clang"
+#     (irmão da pasta do kernel).
+#   - Espera um AnyKernel3 em "../AnyKernel3" (irmão da pasta do kernel)
+#     para gerar o zip flashável.
+#   - É chamado como: ./build.sh --compiler=clang --device=dubai
+#
+# Por isso montamos a árvore assim no runner:
+#   $GITHUB_WORKSPACE/
+#     kernel/         <- android_kernel_motorola_sm7325 (branch MMI-S1RD32.55-33)
+#     toolchains/
+#       clang/        <- Neutron Clang (via AntMan)
+#     AnyKernel3/      <- SM7325-AE/AnyKernel3 (fork específico da família sm7325)
+#
+# COMO USAR:
+# 1. Salve este arquivo como .github/workflows/build-kernel-droidspaces.yml
+#    em qualquer repositório seu (não precisa ser um fork do kernel).
+# 2. Rode manualmente pela aba "Actions" (workflow_dispatch).
+# 3. O zip flashável (AnyKernel3) fica disponível como artifact ao final.
+
+name: Build Kernel SM7325 (dubai) + patches Droidspaces
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Branch do kernel a compilar"
+        required: false
+        default: "MMI-S1RD32.55-33"
+      device:
+        description: "Device (--device= do build.sh)"
+        required: false
+        default: "dubai"
+      extra_build_args:
+        description: "Argumentos extras para o build.sh (ex: --clean --log)"
+        required: false
+        default: ""
+
+env:
+  KERNEL_OWNER: aospa-dubai
+  KERNEL_REPO: android_kernel_motorola_sm7325
+  ANYKERNEL_OWNER: SM7325-AE
+  ANYKERNEL_REPO: AnyKernel3
+  DS_PATCHES_BASE: https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/non-GKI
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout do kernel
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_OWNER }}/${{ env.KERNEL_REPO }}
+          ref: ${{ github.event.inputs.kernel_branch || 'MMI-S1RD32.55-33' }}
+          path: kernel
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Checkout do AnyKernel3 (irmão da pasta do kernel)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ANYKERNEL_OWNER }}/${{ env.ANYKERNEL_REPO }}
+          path: AnyKernel3
+
+      - name: Instalar dependências de build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libncurses-dev \
+            libelf-dev git curl wget perl python3 python-is-python3 \
+            rsync unzip zip cpio kmod device-tree-compiler lz4 zstd \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Baixar toolchain Clang (Neutron Clang via AntMan)
+        run: |
+          set -e
+          mkdir -p toolchains/clang
+          cd toolchains/clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+          ls -la bin | head
+
+      - name: Baixar patches Droidspaces (kernel non-GKI)
+        run: |
+          set -e
+          mkdir -p patches
+          curl -fL -o "patches/01.fix_kernel_panic_in_xt_qtaguid.patch" \
+            "${DS_PATCHES_BASE}/01.fix_kernel_panic_in_xt_qtaguid.patch"
+          curl -fL -o "patches/02.fix_restore_cgroup_file_prefix_handling.patch" \
+            "${DS_PATCHES_BASE}/02.fix_restore%20cgroup%20file%20prefix%20handling%20.patch"
+          ls -la patches
+
+      - name: Aplicar patches no kernel
+        working-directory: kernel
+        run: |
+          set -e
+          for p in ../patches/*.patch; do
+            echo "==> Aplicando: $p"
+            if git apply --check "$p" 2>/dev/null; then
+              git apply "$p"
+            elif git apply --check -p0 "$p" 2>/dev/null; then
+              git apply -p0 "$p"
+            else
+              echo "git apply falhou, tentando 'patch' com fuzz..."
+              patch -p1 --fuzz=3 --forward < "$p"
+            fi
+          done
+          echo "==> Diff aplicado:"
+          git status --short
+
+      - name: Aplicar configs do Droidspaces na defconfig
+        working-directory: kernel
+        run: |
+          set -e
+
+          CONFIG_BLOCK='# --- Droidspaces support (injected by CI) ---
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IPC_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_NETFILTER_XT_TARGET_REJECT=y
+          CONFIG_NETFILTER_XT_TARGET_LOG=y
+          CONFIG_NETFILTER_XT_MATCH_RECENT=y
+          CONFIG_IP_SET=y
+          CONFIG_IP_SET_HASH_IP=y
+          CONFIG_IP_SET_HASH_NET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y'
+
+          DFCF="arch/arm64/configs/vendor/dubai-qgki_defconfig"
+          FRAGMENT="arch/arm64/configs/vendor/ext_config/droidspaces.config"
+
+          # Caso 1: a defconfig final já existe no repo -> build.sh usa ela
+          # diretamente (não passa pelos fragmentos), então anexamos aqui.
+          if [[ -f "$DFCF" ]]; then
+            echo "==> defconfig existente encontrada em $DFCF, anexando configs"
+            printf '\n%s\n' "$CONFIG_BLOCK" >> "$DFCF"
+          fi
+
+          # Caso 2: a defconfig ainda não existe -> build.sh gera a partir
+          # dos fragmentos em vendor/ext_config/*.config. Criamos um
+          # fragmento próprio e o incluímos na linha de merge do build.sh
+          # (ele é reconstruído a cada checkout, então isso é seguro).
+          mkdir -p "$(dirname "$FRAGMENT")"
+          printf '%s\n' "$CONFIG_BLOCK" > "$FRAGMENT"
+
+          sed -i \
+            's#vendor/ext_config/debug-lahaina-dubai\.config savedefconfig#vendor/ext_config/debug-lahaina-dubai.config vendor/ext_config/droidspaces.config savedefconfig#' \
+            build.sh
+
+          grep -n "droidspaces.config" build.sh || echo "AVISO: linha de merge não encontrada/alterada em build.sh — confira manualmente."
+
+      - name: Tornar build.sh executável
+        working-directory: kernel
+        run: chmod +x build.sh
+
+      - name: Compilar kernel (./build.sh)
+        working-directory: kernel
+        run: |
+          ./build.sh \
+            --compiler=clang \
+            --device=${{ github.event.inputs.device || 'dubai' }} \
+            ${{ github.event.inputs.extra_build_args }}
+
+      - name: Publicar artefatos (zip AnyKernel3 + Image)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-dubai-droidspaces-${{ github.run_number }}
+          path: |
+            kernel/out/*.zip
+            kernel/work/arch/arm64/boot/Image*
+          if-no-files-found: warn
